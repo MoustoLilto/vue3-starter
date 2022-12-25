@@ -1,0 +1,192 @@
+default:
+    tags: 
+        - ${CI_RUNNER_TAG}
+
+stages:
+    - lint
+    - test
+    - build
+    - deploy
+
+variables:
+    # Global conf
+    CI_RUNNER_TAG:
+        description: "The name of the gitlab Runner"
+        value: "gitlab-runner-mob"
+    SRC_ROOT:
+        description: "The path to package.json file"
+        value: "."
+    NODE_VERSION:
+        description: "The project target node version"
+        value: "17"
+
+    # Nexus related
+    ARTIFACT_NAME:
+        description: "The nexus project name"
+        value: "etime"
+    NEXUS_RELEASE_URL:
+        description: "The nexus release url"
+        value: "https://nexus.engie-cofely.net/repository/engie-cofely-releases/com/engie/solutions/applis/${ARTIFACT_NAME}"
+    NEXUS_SNAPSHOT_URL:
+        description: "The nexus snapshot url"
+        value: "https://nexus.engie-cofely.net/repository/engie-cofely-snapshots/com/engie/solutions/applis/${ARTIFACT_NAME}"
+    
+    # Project url
+    PROD_URL:
+        description: "The production url"
+        value: "https://etime.engie-solutions.fr/"
+    PPR_URL:
+        description: "The pre-production url"
+        value: "https://etime-ppr.engie-solutions.fr/"
+    REC_URL:
+        description: "The staging url"
+        value: "https://etime-rec.engie-solutions.fr/"
+    
+    # Terraform related
+    PROJECT_ID:
+        description: "The project id in Terraform Gitlab Pipelines"
+        value: "1492"
+    GITLAB_PIPELINE_API:
+        description: "The URL to trigger Terraform Gitlab Pipelines"
+        value: "https://gitlab.engie-cofely.net/api/v4/projects/${PROJECT_ID}/trigger/pipeline"
+
+workflow:
+    rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+        - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+          when: never
+        - if: $CI_COMMIT_BRANCH
+        - if: $CI_COMMIT_TAG == "PROD"
+
+
+prepare:
+    stage: .pre
+    script:
+        - chmod 744 ./ci/prepare-env.sh
+        - ./ci/prepare-env.sh ${SRC_ROOT} ${NODE_VERSION}
+    when: always
+    artifacts:
+        paths:
+            - ${SRC_ROOT}/node_modules/
+        expire_in: 1 hour
+
+lint:
+    stage: lint
+    script:
+        - cd ${SRC_ROOT}
+        - pwd
+        - pnpm run lint
+    when: on_success
+    dependencies:
+        - prepare
+
+test:
+    stage: test
+    script:
+        - cd ${SRC_ROOT}
+        - pwd
+        - pnpm run test:ci
+        - pnpm coverage
+    coverage: /All files[^|]*\|[^|]*\s+([\d\.]+)/
+    when: on_success
+    dependencies:
+        - prepare
+    artifacts:
+        when: always
+        reports:
+            junit: test-report.xml
+
+# CONFIG BASE
+.build:
+    stage: build
+    script:
+        - chmod 744 ./ci/build.sh
+        - ./ci/build.sh ${SRC_ROOT}
+    dependencies:
+        - prepare
+    artifacts:
+        paths:
+            - ${SRC_ROOT}/dist.zip
+        expire_in: 1 day
+    environment:
+        action: prepare
+
+.deploy:
+    stage: deploy
+    script:
+        - chmod 744 ./ci/deploy.sh
+        - ./ci/deploy.sh ${SRC_ROOT} ${ARTIFACT_NAME} ${NEXUS_SNAPSHOT_URL} ${NEXUS_RELEASE_URL}
+    environment:
+        action: start
+
+
+# REC BUILD AND DEPLOY
+build_rec:
+    extends: .build
+    environment:
+        name: rec
+    rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+        - if: $CI_COMMIT_BRANCH
+
+deploy_rec:
+    extends: .deploy
+    dependencies:
+        - build_rec
+    environment:
+        name: rec
+        url: ${REC_URL}
+    needs: ["build_rec"]
+    rules:
+        - if: $CI_COMMIT_TAG == "PROD"
+          when: never
+        - if: $CI_COMMIT_BRANCH == "main"
+        - when: manual
+
+
+# PPR BUILD AND DEPLOY
+build_ppr:
+    extends: .build
+    environment:
+        name: ppr
+    rules:
+        - if: $CI_COMMIT_TAG == "PROD"
+          when: never
+        - when: manual
+
+deploy_ppr:
+    extends: .deploy
+    dependencies:
+        - build_ppr
+    environment:
+        name: ppr
+        url: ${PPR_URL}
+    needs: ["build_ppr"]
+    rules:
+        - if: $CI_COMMIT_TAG == "PROD"
+          when: never
+        - when: on_success
+
+
+# PROD BUILD AND DEPLOY
+build_prod:
+    extends: .build
+    environment:
+        name: prod
+    rules:
+        - if: $CI_COMMIT_TAG == "PROD"
+          when: manual
+        - when: never
+
+deploy_prod:
+    extends: .deploy
+    dependencies:
+        - build_prod
+    environment:
+        name: prod
+        url: ${PROD_URL}
+    needs: ["build_prod"]
+    rules:
+        - if: $CI_COMMIT_TAG == "PROD"
+          when: on_success
+        - when: never
